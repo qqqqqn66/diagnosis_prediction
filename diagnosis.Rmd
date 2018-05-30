@@ -1,0 +1,306 @@
+---
+title: "Untitled"
+author: "Qinnan Que"
+date: "April 18, 2018"
+output: pdf_document
+---
+```{r}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(DataExplorer)
+  library(psych)
+  library(sqldf)
+  library(VIM)
+  library(missForest)
+  library(ROCR)
+  library(e1071)
+  library(caret)
+  library(randomForest)
+})
+```
+
+Load data
+```{r}
+df <- read.csv("D:/Github/diagnosis prediction/diagnosis_prediction/training_data.csv")
+```
+
+Exploratory data analysis
+```{r}
+str(df)
+#check data type 
+sapply(df,class)
+
+#plot continuous density
+DensityContinuous(df)
+
+#change gleason_score, race, family_history, first_degree_history,previous_cancer, smoker, rd_thrpy
+# h_thrpy, chm_thrpy, cry_thrpy, brch_thrpy, rad_rem,multi_thrpy, survival_1_year, survival_7_years 
+#from interger to factore
+
+cols <- c("gleason_score", "race","family_history","first_degree_history","previous_cancer","smoker", "rd_thrpy", "h_thrpy", "chm_thrpy", "cry_thrpy", "brch_thrpy", "rad_rem","multi_thrpy", "survival_1_year", "survival_7_years")   
+df[,cols] <- lapply(df[,cols], FUN=as.factor)
+
+BarDiscrete(df)
+
+```
+
+```{r}
+# symptoms
+# split symptoms
+df$symptomList <- strsplit(as.character(df$symptoms), split = ",")
+# find unique symptoms
+uniqueSymptom <- unique(unlist(df$symptomList))
+# If sympton is matched, Ture, not then False
+SymptomTF <- function(all,symp) return(symp %in% all)
+
+for(i in 1:length(uniqueSymptom))
+  df[, uniqueSymptom[i]] <- as.factor(as.numeric(lapply(df[, 'symptomList'], SymptomTF, uniqueSymptom[i])))
+```
+
+```{r}
+# create bmi column to replace height and weight
+#df$bmi<-(df$weight*0.4536)/(df$height*0.0254)^2
+# remove columns 
+df1<- df %>% select(-one_of(c("id","diagnosis_date","symptoms","symptomList")))
+```
+
+```{r}
+# check correlation
+df_numeric <- df[,c("age","tumor_diagnosis", "tumor_6_months","tumor_1_year","psa_diagnosis","psa_6_months", "psa_1_year","height","weight","tea")]
+
+qplot(x=Var1, y=Var2, data=melt(cor(df_numeric, use="p")), fill=value, geom="tile") + scale_fill_gradient2(limits=c(-1, 1)) + theme(axis.text.x = element_text(angle = 45, hjust =1))
+```
+
+Clean and Impute missing values
+```{r}
+PlotMissing(df1 %>% filter(survival_7_years == 0))
+aggr(df1, prop=FALSE, numbers=TRUE)
+
+# tumor_6_months and psa_6_months both have missing values up to 60+%, but highly correlated with tumor_diagnosis and psa_diagnosis, so remove those two columns
+df2<- df1 %>% select(-one_of(c("tumor_6_months", "psa_6_months")))
+
+DensityContinuous(df_numeric)
+
+#check randomness of the missing value
+# If there is a pattern then it is not Missing at Random, then imputing the data can lead to skewed analysis
+# If do not see any pattern after running the crosstable code for variables, it means it is Missing completely at random, then can impute or remove
+
+with(app_data, CrossTable(average_rating, region_na))
+with(app_data, CrossTable(app_type, region_na))
+
+
+#impute age, height, weight, tea via simple random resampling
+random.imp <- function (a){
+  missing <- is.na(a) 
+  n.missing <- sum(missing) 
+  a.obs <- a[!missing] 
+  imputed <- a 
+  imputed[missing] <- sample (a.obs, n.missing, replace=TRUE)
+  return (imputed)
+}  
+
+df2$age <- random.imp(df2$age)
+df2$height <- random.imp(df2$height)
+df2$weight <- random.imp(df2$weight)
+df2$tea <- random.imp(df2$tea)
+
+#family_history, first_degree_history, previous_cancer, smoker are missing together (10%) randomly, remove all the rows who missed these four 
+
+df3 <- df2 %>% filter(!is.na(family_history) & !is.na(first_degree_history) & !is.na(previous_cancer) & !is.na(smoker))
+
+#impute missing values using MICE for rest variables
+forest_data <- df3 %>%select(tumor_diagnosis,tumor_1_year,psa_diagnosis, psa_1_year,gleason_score)
+df4 <- missForest(forest_data)
+
+saveRDS(df4, file = "D:/UMN_BA/Job/tech interview/df4.rds")
+
+cols_imp <- c("tumor_diagnosis","tumor_1_year","psa_diagnosis", "psa_1_year","gleason_score")
+df3[,cols_imp] <- df4$ximp[,cols_imp]
+
+PlotMissing(df3)
+aggr(df2, prop=FALSE, numbers=TRUE)
+
+data <- df3
+saveRDS(data, file = "D:/UMN_BA/Job/tech interview/data.rds")
+```
+
+```{r}
+data <- readRDS("D:/UMN_BA/Job/tech interview/data.rds")
+#data$gleason_score <- as.integer(data$gleason_score)
+```
+
+```{r}
+exp <- data %>% filter(survival_1_year==1& survival_7_years==0)
+DensityContinuous(exp)
+BarDiscrete(exp)
+
+```
+
+
+
+Modeling
+```{r}
+#normalization
+normalize <- function(x){
+  return (100*(x - min(x))/(max(x) - min(x)))}
+```
+
+1yr
+```{r}
+#data$bim <- (data$weight*0.4536)/(data$height*0.0254)^2
+col_nor <- c("age","height","weight","tumor_diagnosis","tumor_1_year","psa_diagnosis", "psa_1_year")#,"bim","gleason_score")
+data[,col_nor] <- lapply(data[,col_nor], normalize)
+
+data_right <-data %>% 
+  select(-one_of(c("survival_7_years","tea","race","survival_1_year")))#,"height","weight")))
+
+data_1yr <- data_right %>% mutate(survival_1_year=data$survival_1_year)
+#partition data into training and testing
+set.seed(181818)
+train<-sample_frac(data_1yr, 0.8)
+test<-data_1yr[-as.numeric(rownames(train)),]
+```
+
+7yr
+```{r}
+data_7yr <- data_1yr %>% mutate(survival_7_years=data$survival_7_years)
+#partition data into training and testing
+set.seed(181818)
+train7<-sample_frac(data_7yr, 0.8)
+test7<-data_7yr[-as.numeric(rownames(train7)),]
+```
+
+```{r}
+model1 <- glm(survival_1_year ~. , data = train, family = binomial)
+summary(model1)
+
+model2 <- glm(survival_1_year ~ gleason_score+n_score+smoker+age+tumor_1_year+rd_thrpy+cry_thrpy+S10+U05+O09+O08+bim , data = train, family = binomial)
+summary(model2)
+
+predict <- predict(model2,newdata = test, type = "response")
+#confusion matrix
+
+pr <- prediction(predict, test$survival_1_year)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+
+
+
+
+
+confusionMatrix(predict, test$survival_1_year)
+
+table(train$survival_1_year, predict > 0.5)
+#ROCR Curve
+library(ROCR)
+ROCRpred <- prediction(predict, train$survival_1_year)
+ROCRperf <- performance(ROCRpred, 'tpr','fpr')
+plot(ROCRperf, colorize = TRUE, text.adj = c(-0.2,1.7))
+
+```
+### Random forest 1yr
+
+```{r}
+# Tune Random Forest with an improvement
+set.seed(3)
+bestmtry <- tuneRF(x=train[,1:39], y=train$survival_1_year, stepFactor=1.5, improve=1e-5, ntree=500)
+print(bestmtry)
+
+# fit the model with optimal parameters
+set.seed(3)
+rfBest <-  randomForest(survival_1_year~ . ,data=train, mtry=9, ntree=500, importance=TRUE, threshold=0.91)
+print(rfBest)
+plot(rfBest)
+
+
+rfPred <-predict(rfBest,newdata = test, type = "class")
+confusionMatrix(rfPred, test$survival_1_year)
+#misclassification Rate
+mean(rfPred!=test$survival_1_year)*100
+
+#gleason_score+n_score+smoker+tumor_1_year+rd_thrpy+h_thrpy+S10+U05+S04+O09+O08
+```
+
+
+```{r}
+library(mlr)
+
+#Defining Learning
+rfLRN <- makeLearner("classif.randomForest")
+
+#Defining the Parameter Space
+ps <- makeParamSet(
+  makeNumericParam("cutoff", lower = .4, upper = .5, trafo = function(x) c(x, 1-x))
+)
+
+#Defining Resampling
+cvTask <- makeResampleDesc("CV", iters=5L)
+
+#Defining Search
+search <-  makeTuneControlGrid()
+
+#Defining the Task
+trainTask <- makeClassifTask(data = train, target = "survival_1_year")
+
+rfLRN$par.vals <- list(ntree = 100L, importance=TRUE)
+
+tune <- tuneParams(learner = rfLRN
+                    ,task = trainTask
+                    ,resampling = cvTask
+                    ,measures = list(tpr,fpr,fnr,fpr,acc)
+                    ,par.set = ps
+                    ,control = search
+                    ,show.info = TRUE)
+
+rf.lrn$par.vals <- list(ntree = 100L, importance=TRUE, cutoff = 0.4)
+r <- resample(learner = rfLRN, task = trainTask, resampling = cvTask, measures =list(acc), ,show.info = T)
+
+
+```
+
+```{r}
+model7 <- glm(survival_7_years ~. , data = train7, family = binomial)
+summary(model7)
+```
+
+### Random forest 7yr
+```{r}
+# Tune Random Forest with an improvement
+set.seed(3)
+bestmtry <- tuneRF(x=train7[,1:41], y=train7$survival_7_years, stepFactor=1.5, improve=1e-5, ntree=500)
+print(bestmtry)
+
+# fit the model with optimal parameters
+set.seed(3)
+rfBest7 <-  randomForest(survival_7_years~gleason_score+n_score+smoker+tumor_1_year+tumor_1_year^7+rd_thrpy+h_thrpy+S10+U05+S04+O09+O08+survival_1_year,data=train7, mtry=3, ntree=500, importance=TRUE, threshold=0.91)
+print(rfBest7)
+plot(rfBest7)
+
+#linear svm performance with cost
+rfPred7 <-predict(rfBest7,newdata = test7, type = "class")
+confusionMatrix(rfPred7, test7$survival_7_years)
+#misclassification Rate
+mean(rfPred7!=test7$survival_7_years)*100
+```
+
+```{r}
+#fit regression tree model
+trctrl <- trainControl(method = "cv", number = 10)
+trFit0 <- rpart(survival_7_years ~ .,  data = train7)
+trFit<- prune(trFit0,cp= trFit0$cptable[which.min(trFit0$cptable[,"xerror"]),"CP"])
+
+#Output of tree fit
+trFit
+fancyRpartPlot(trFit, uniform=TRUE, main="Pruned Regression Tree",palettes=c("Greys", "Oranges"), type=2)
+
+#prediction
+trPredict <- predict(trFit,newdata = test7)
+
+#Get the confusion matrix to see accuracy value and other parameter values
+trvalues<-data.frame(obs = testing$Spending, pred=trPredict)
+```
